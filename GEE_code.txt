@@ -1,0 +1,378 @@
+/**************************************************
+ * Global Level-16 DGG hex extraction
+ *
+ * Hex source:
+ *   projects/my-project-1552013890774/assets/global_hex_grid/
+ *   shard_01 ... shard_38
+ *
+ * Output per hex:
+ *   seqnum16,
+ *   n_total,
+ *   n_land,
+ *   n_freshwater,
+ *   n_ice,
+ *   n_barren,
+ *   n_built,
+ *   n_crop,
+ *   n_pasture,
+ *   n_other_intensive_treecrop,
+ *   n_nonhabitat,
+ *   n_habitat
+ *
+ **************************************************/
+
+/*****************************
+ * 1. Settings
+ *****************************/
+
+var year = 2024;
+var startDate = year + '-01-01';
+var endDate = year + '-12-31';
+
+var thresholdPctWater = 95;
+var thresholdPctSnow = 99;
+var minCluster = 10;
+// Change id 1-38 to select different group of Hex to export. 
+var id='23'
+
+// DW frequency threshold for crop, built and barren.
+var anthroThreshold = 40;
+
+// Extraction resolution.
+var extractScale = 10;
+
+// Property name in the Level-16 hex assets.
+var L16_FIELD = 'seqnum';
+
+var PROJECT = 'my-project-1552013890774';
+var ASSET_ROOT = 'projects/' + PROJECT + '/assets/global_hex_grid/';
+var HEX_ASSET = ASSET_ROOT + 'shard_'+id;
+
+// Use the Level-16 identifier for deterministic batching.
+var BATCH_FIELD = L16_FIELD;
+
+// Global extraction is large. Increase this value if individual tasks
+// exceed Earth Engine memory, feature-count or runtime limits.
+var N_BATCHES = 40;
+
+// Export names.
+var EXPORT_FOLDER = 'Global_Thriving_L16_10';
+var EXPORT_NAME =
+  'Global_L16_2024_DWP' +
+  anthroThreshold +
+  '_shard_'+id;
+
+/*****************************
+ * 2. Load global L16 shards
+ *****************************/
+ 
+var hexes = ee.FeatureCollection(HEX_ASSET);
+
+print('Global L16 hex count', hexes.size());
+print('First global L16 hex - check property names', hexes.first());
+
+/*****************************
+ * 3. Load datasets
+ *****************************/
+
+var dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+  .filterDate(startDate, endDate)
+  .select('label');
+
+var worldCover = ee.Image('ESA/WorldCover/v200/2021')
+  .select('Map');
+
+/*****************************
+ * 4. Added datasets
+ *****************************/
+
+// GPW class 1 = cultivated grassland / pasture.
+var gpw = ee.ImageCollection(
+  'projects/global-pasture-watch/assets/ggc-30m/v1/grassland_c'
+)
+  .filterDate('2022-01-01', '2023-01-01')
+  .first();
+
+var cultivatedGrass = gpw.eq(1)
+  .unmask(0)
+  .toUint8()
+  .reproject({
+    crs: 'EPSG:4326',
+    scale: extractScale
+  })
+  .rename('pasture');
+
+// Tree crop / plantation.
+var treeCrop = ee.Image(
+  'projects/ee-duzhenrong02/assets/SDPTV3'
+)
+  .eq(2)
+  .unmask(0)
+  .toUint8()
+  .reproject({
+    crs: 'EPSG:4326',
+    scale: extractScale
+  })
+  .rename('other_intensive_treecrop');
+
+/*****************************
+ * 5. Dynamic World counts
+ *****************************/
+
+// Dynamic World label codes:
+// 0 water, 1 trees, 2 grass, 3 flooded vegetation,
+// 4 crops, 5 shrub and scrub, 6 built,
+// 7 bare, 8 snow and ice.
+
+var totalObs = dw.count().rename('total_obs');
+var hasObs = totalObs.gt(0);
+
+var dwCounts = dw.map(function(img) {
+  return ee.Image.cat([
+    img.eq(0).rename('water'),
+    img.eq(8).rename('snow'),
+    img.eq(4).rename('crop'),
+    img.eq(6).rename('built'),
+    img.eq(7).rename('bare')
+  ]).toUint8();
+}).sum();
+
+var waterObs = dwCounts.select('water');
+var snowObs = dwCounts.select('snow');
+var cropObs = dwCounts.select('crop');
+var builtObs = dwCounts.select('built');
+var bareObs = dwCounts.select('bare');
+
+var pctWater = waterObs.divide(totalObs).multiply(100)
+  .updateMask(hasObs)
+  .rename('pct_water');
+
+var pctSnow = snowObs.divide(totalObs).multiply(100)
+  .updateMask(hasObs)
+  .rename('pct_snow_ice');
+
+var pctCrop = cropObs.divide(totalObs).multiply(100)
+  .updateMask(hasObs)
+  .rename('pct_crop');
+
+var pctBuilt = builtObs.divide(totalObs).multiply(100)
+  .updateMask(hasObs)
+  .rename('pct_built');
+
+var pctBare = bareObs.divide(totalObs).multiply(100)
+  .updateMask(hasObs)
+  .rename('pct_bare');
+
+/*****************************
+ * 6. Water, ice and land masks
+ *****************************/
+
+var waterDominant = pctWater.gte(thresholdPctWater);
+var waterClusterSize = waterDominant.connectedPixelCount(100, true);
+var smallWater = waterDominant.and(waterClusterSize.lt(minCluster));
+
+var waterMask = pctWater.lt(thresholdPctWater)
+  .where(smallWater, 1)
+  .rename('water_mask');
+
+var snowDominant = pctSnow.gte(thresholdPctSnow);
+var snowClusterSize = snowDominant.connectedPixelCount(100, true);
+var smallSnow = snowDominant.and(snowClusterSize.lt(minCluster));
+
+var snowMask = pctSnow.lt(thresholdPctSnow)
+  .where(smallSnow, 1)
+  .rename('snow_mask');
+
+// WorldCover 80 = permanent water. Used here to remove ocean.
+var oceanMask = worldCover.neq(80)
+  .rename('ocean_mask');
+
+var landMask = waterMask
+  .and(snowMask)
+  .and(oceanMask)
+  .rename('land_mask');
+
+// Unified valid-pixel mask: non-ocean pixels with DW observations.
+var validMask = oceanMask.and(hasObs);
+
+/*****************************
+ * 7. Component masks
+ *****************************/
+
+var isTotal = ee.Image(1)
+  .updateMask(validMask)
+  .rename('n_total')
+  .toUint8();
+
+var isLand = ee.Image(1)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('n_land')
+  .toUint8();
+
+var isFreshwater = waterMask.not()
+  .and(snowMask)
+  .unmask(0)
+  .updateMask(validMask)
+  .rename('n_freshwater')
+  .toUint8();
+
+var isIce = snowMask.not()
+  .unmask(0)
+  .updateMask(validMask)
+  .rename('n_ice')
+  .toUint8();
+
+var isCrop = pctCrop.gt(anthroThreshold)
+  .unmask(0)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('n_crop')
+  .toUint8();
+
+var isBuilt = pctBuilt.gt(anthroThreshold)
+  .unmask(0)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('n_built')
+  .toUint8();
+
+var isBarren = pctBare.gt(anthroThreshold)
+  .unmask(0)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('n_barren')
+  .toUint8();
+
+var isPasture = cultivatedGrass
+  .unmask(0)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('n_pasture')
+  .toUint8();
+
+var isOtherIntensive = treeCrop
+  .unmask(0)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('n_other_intensive_treecrop')
+  .toUint8();
+
+// Nonhabitat: crop OR built OR pasture OR other intensive.
+var nonhabitatMask = isCrop
+  .or(isBuilt)
+  .or(isPasture)
+  .or(isOtherIntensive)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('nonhabitat_mask');
+
+var isNonhabitat = nonhabitatMask
+  .unmask(0)
+  .updateMask(validMask)
+  .updateMask(landMask)
+  .rename('n_nonhabitat')
+  .toUint8();
+
+/*****************************
+ * 8. Extraction stack
+ *****************************/
+
+var extractionStack = ee.Image.cat([
+  isTotal,
+  isLand,
+  isFreshwater,
+  isIce,
+  isBarren,
+  isBuilt,
+  isCrop,
+  isPasture,
+  isOtherIntensive,
+  isNonhabitat
+]);
+
+var selectors = [
+  'seqnum16',
+  'n_total',
+  'n_land',
+  'n_freshwater',
+  'n_ice',
+  'n_barren',
+  'n_built',
+  'n_crop',
+  'n_pasture',
+  'n_other_intensive_treecrop',
+  'n_nonhabitat'
+];
+
+/*****************************
+ * 9. Extraction function
+ *
+ * sum().unweighted() on binary bands = pixel counts.
+ *****************************/
+
+function extractBatch(hexBatch) {
+  return extractionStack.reduceRegions({
+    collection: hexBatch,
+    reducer: ee.Reducer.sum().unweighted(),
+    scale: extractScale,
+    crs: 'EPSG:4326',
+    tileScale: 4
+  }).map(function(f) {
+    var nLand = ee.Number(
+      ee.Algorithms.If(f.get('n_land'), f.get('n_land'), 0)
+    );
+
+    var nNonhabitat = ee.Number(
+      ee.Algorithms.If(f.get('n_nonhabitat'), f.get('n_nonhabitat'), 0)
+    );
+
+    return ee.Feature(null, {
+      'seqnum16': f.get(L16_FIELD),
+      'n_total': f.get('n_total'),
+      'n_land': f.get('n_land'),
+      'n_freshwater': f.get('n_freshwater'),
+      'n_ice': f.get('n_ice'),
+      'n_barren': f.get('n_barren'),
+      'n_built': f.get('n_built'),
+      'n_crop': f.get('n_crop'),
+      'n_pasture': f.get('n_pasture'),
+      'n_other_intensive_treecrop': f.get(
+        'n_other_intensive_treecrop'
+      ),
+      'n_nonhabitat': f.get('n_nonhabitat'),
+
+      // Enforce the analytical identity and prevent negative values.
+      'n_habitat': nLand.subtract(nNonhabitat).max(0)
+    });
+  });
+}
+
+/*****************************
+ * 10. Export batches to Google Drive
+ *****************************/
+
+var hexesTagged = hexes.map(function(f) {
+  return f.set(
+    'batch_id',
+    ee.Number(f.get(BATCH_FIELD)).mod(N_BATCHES)
+  );
+});
+
+for (var b = 0; b < N_BATCHES; b++) {
+
+  var batch = hexesTagged.filter(
+    ee.Filter.eq('batch_id', b)
+  );
+
+  var results = extractBatch(batch);
+
+  Export.table.toDrive({
+    collection: results,
+    description: EXPORT_NAME + '_b' + b,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: EXPORT_NAME + '_b' + b,
+    fileFormat: 'CSV',
+    selectors: selectors
+  });
+}
